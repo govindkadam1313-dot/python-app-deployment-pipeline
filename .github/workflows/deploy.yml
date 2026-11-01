@@ -1,0 +1,86 @@
+name: Deploy Python app to EC2
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: github-actions-deploy
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Set up SSH
+        env:
+          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Create app directory on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: ssh "$EC2_USER@$EC2_HOST" 'mkdir -p "$HOME/python-app"'
+
+      - name: Copy application files to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: scp app.py requirements.txt "$EC2_USER@$EC2_HOST:python-app/"
+
+      - name: Install dependencies and restart app
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE'
+          set -eu
+
+          APP_DIR="$HOME/python-app"
+          python3 -m venv "$APP_DIR/.venv"
+          "$APP_DIR/.venv/bin/pip" install --requirement "$APP_DIR/requirements.txt"
+
+          sudo tee /etc/systemd/system/python-app.service >/dev/null <<UNIT
+          [Unit]
+          Description=Example Python Flask application
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=$(id -un)
+          WorkingDirectory=$APP_DIR
+          Environment=PORT=8000
+          ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/app.py
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable python-app
+          sudo systemctl restart python-app
+          REMOTE
